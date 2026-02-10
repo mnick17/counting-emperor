@@ -32,6 +32,9 @@ TRACK_CHANNELS = {
 
 COMMANDS_CHANNEL_ID = 1315525419813834783
 
+# role to lock/unlock
+LOCK_ROLE_ID = 1315670624898650152
+
 # -------- CONSTANTS --------
 MISTAKE_BOT_CHANNEL_ID = 510016054391734273
 MISTAKE_BOT_RUINED_ID = 639599059036012605
@@ -137,6 +140,7 @@ alt_to_main = {
     627998970320388106: 577666133549645834,  # "onyan"
     1305061438959779871: 735957682913017866, # "onyx"
     0: 668223790500544512, # "pia"
+    1051529942107689020: 485412155596996628,  # "quv2"
     592670631854735361: 485412155596996628,  # "quv"
     1345019952310259732: 154721499159199744, # "raydop"
     0: 572231874525659189, # "rreae"
@@ -288,6 +292,37 @@ def format_accuracy_display(acc_value):
     if acc_value == 100:
         return "100%"
     return f"{acc_value:06.3f}%"
+
+# -------- Lock/Unlock helper for TRACK_CHANNELS --------
+async def lock_track_channels(guild: discord.Guild):
+    try:
+        role = guild.get_role(LOCK_ROLE_ID) if guild else None
+        if role is None:
+            return
+        for ch_id in TRACK_CHANNELS:
+            ch = bot.get_channel(ch_id) or (guild.get_channel(ch_id) if guild else None)
+            if ch:
+                try:
+                    await ch.set_permissions(role, send_messages=False, reason="Run started: locking channels")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+async def unlock_track_channels(guild: discord.Guild):
+    try:
+        role = guild.get_role(LOCK_ROLE_ID) if guild else None
+        if role is None:
+            return
+        for ch_id in TRACK_CHANNELS:
+            ch = bot.get_channel(ch_id) or (guild.get_channel(ch_id) if guild else None)
+            if ch:
+                try:
+                    await ch.set_permissions(role, send_messages=True, reason="Run ended: unlocking channels")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 # -------- UTIL: finalize two-person run --------
 def _append_two_person_history(ch: int, runners: tuple, start_ts: float, end_ts: float):
@@ -680,6 +715,14 @@ async def run_timer(channel: discord.abc.Messageable):
     message = await channel.send(embed=embed)
     await message.pin()
 
+    # unlock previously locked channels
+    try:
+        guild = channel.guild if hasattr(channel, "guild") else None
+        if guild:
+            await unlock_track_channels(guild)
+    except Exception:
+        pass
+
     # clear run-only state
     run_counts_by_user.clear()
     run_team_mistakes.clear()
@@ -755,6 +798,14 @@ async def start_run(interaction: discord.Interaction):
         last_50_senders_per_channel.clear()
         two_person_runs.clear()
         run_two_person_history_per_channel.clear()
+
+    # lock tracked channels for the specified role
+    try:
+        guild = interaction.guild
+        if guild:
+            await lock_track_channels(guild)
+    except Exception:
+        pass
 
     await interaction.response.send_message(
         "24 hours attempt started! Stats are now being collected."
@@ -939,6 +990,14 @@ async def end_run(interaction: discord.Interaction, save: bool = True):
     )
 
     await interaction.response.send_message(embed=embed)
+
+    # unlock previously locked channels
+    try:
+        guild = interaction.guild
+        if guild:
+            await unlock_track_channels(guild)
+    except Exception:
+        pass
 
     # clear run-only state
     async with counts_lock:
