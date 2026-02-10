@@ -32,8 +32,23 @@ TRACK_CHANNELS = {
 
 COMMANDS_CHANNEL_ID = 1315525419813834783
 
-# role to lock/unlock
-LOCK_ROLE_ID = 1315670624898650152
+# roles to lock/unlock
+LOCK_ROLE_IDS = {
+    1315670624898650152,
+    1315670215006359602
+}
+
+# special runner roles - if the run starter has one of these, enable Send Messages for that role during the run
+SPECIAL_ROLES = {
+    1468272749142212718,
+    1468272788874989653,
+    1468272811859640524,
+    1468272842327195805
+}
+
+# store original overwrites when modifying special roles during run
+run_original_overwrites = defaultdict(dict)
+run_enabled_special_roles = set()
 
 # -------- CONSTANTS --------
 MISTAKE_BOT_CHANNEL_ID = 510016054391734273
@@ -293,36 +308,129 @@ def format_accuracy_display(acc_value):
         return "100%"
     return f"{acc_value:06.3f}%"
 
+def _overwrite_has_any(ow: discord.PermissionOverwrite) -> bool:
+    # returns True if overwrite has any explicit permission set (not all None)
+    if ow is None:
+        return False
+    for attr in (
+        "add_reactions", "manage_messages", "manage_channels", "manage_roles", "view_channel",
+        "send_messages", "read_message_history", "send_tts", "connect", "speak",
+        "use_application_commands", "embed_links", "attach_files", "use_external_emojis",
+        "use_external_stickers"
+    ):
+        if getattr(ow, attr, None) is not None:
+            return True
+    return False
+
 # -------- Lock/Unlock helper for TRACK_CHANNELS --------
 async def lock_track_channels(guild: discord.Guild):
     try:
-        role = guild.get_role(LOCK_ROLE_ID) if guild else None
-        if role is None:
-            return
-        for ch_id in TRACK_CHANNELS:
-            ch = bot.get_channel(ch_id) or (guild.get_channel(ch_id) if guild else None)
-            if ch:
-                try:
-                    await ch.set_permissions(role, send_messages=False, reason="Run started: locking channels")
-                except Exception:
-                    pass
+        for role_id in LOCK_ROLE_IDS:
+            role = guild.get_role(role_id)
+            if role is None:
+                continue
+
+            for ch_id in TRACK_CHANNELS:
+                ch = bot.get_channel(ch_id) or guild.get_channel(ch_id)
+                if ch:
+                    try:
+                        await ch.set_permissions(
+                            role,
+                            send_messages=False,
+                            reason="Run started: locking channels"
+                        )
+                    except Exception:
+                        pass
     except Exception:
         pass
 
 async def unlock_track_channels(guild: discord.Guild):
     try:
-        role = guild.get_role(LOCK_ROLE_ID) if guild else None
-        if role is None:
-            return
-        for ch_id in TRACK_CHANNELS:
-            ch = bot.get_channel(ch_id) or (guild.get_channel(ch_id) if guild else None)
-            if ch:
-                try:
-                    await ch.set_permissions(role, send_messages=True, reason="Run ended: unlocking channels")
-                except Exception:
-                    pass
+        for role_id in LOCK_ROLE_IDS:
+            role = guild.get_role(role_id)
+            if role is None:
+                continue
+
+            for ch_id in TRACK_CHANNELS:
+                ch = bot.get_channel(ch_id) or guild.get_channel(ch_id)
+                if ch:
+                    try:
+                        await ch.set_permissions(
+                            role,
+                            send_messages=True,
+                            reason="Run ended: unlocking channels"
+                        )
+                    except Exception:
+                        pass
     except Exception:
         pass
+
+# -------- Special roles enable/restore helpers --------
+async def enable_special_roles_for_member(guild: discord.Guild, member: discord.Member):
+    global run_original_overwrites, run_enabled_special_roles
+    if guild is None or member is None:
+        return
+
+    member_role_ids = {r.id for r in member.roles}
+    to_enable = member_role_ids & SPECIAL_ROLES
+    if not to_enable:
+        return
+
+    run_enabled_special_roles = set(to_enable)
+
+    async with counts_lock:
+        for ch_id in TRACK_CHANNELS:
+            ch = bot.get_channel(ch_id) or guild.get_channel(ch_id)
+            if not ch:
+                continue
+            for rid in to_enable:
+                role = guild.get_role(rid)
+                if role is None:
+                    continue
+                try:
+                    prev = ch.overwrites_for(role)
+                except Exception:
+                    prev = None
+                prev_save = None
+                try:
+                    if prev is not None and _overwrite_has_any(prev):
+                        prev_save = prev
+                except Exception:
+                    prev_save = None
+                run_original_overwrites[ch_id][rid] = prev_save
+                try:
+                    await ch.set_permissions(role, send_messages=True, reason="Run started: enabling special role for runner")
+                except Exception:
+                    pass
+
+async def restore_special_roles(guild: discord.Guild):
+    global run_original_overwrites, run_enabled_special_roles
+    if guild is None:
+        # clear stored data anyway
+        run_original_overwrites.clear()
+        run_enabled_special_roles.clear()
+        return
+
+    async with counts_lock:
+        for ch_id, role_map in list(run_original_overwrites.items()):
+            ch = bot.get_channel(ch_id) or guild.get_channel(ch_id)
+            if not ch:
+                continue
+            for rid, prev in role_map.items():
+                role = guild.get_role(rid)
+                if role is None:
+                    continue
+                try:
+                    if prev is None:
+                        # remove explicit overwrite (restore to "no explicit allow/deny")
+                        await ch.set_permissions(role, overwrite=None, reason="Run ended: restoring special role overwrite")
+                    else:
+                        # restore previous explicit overwrite object
+                        await ch.set_permissions(role, overwrite=prev, reason="Run ended: restoring special role overwrite")
+                except Exception:
+                    pass
+        run_original_overwrites.clear()
+        run_enabled_special_roles.clear()
 
 # -------- UTIL: finalize two-person run --------
 def _append_two_person_history(ch: int, runners: tuple, start_ts: float, end_ts: float):
@@ -715,6 +823,14 @@ async def run_timer(channel: discord.abc.Messageable):
     message = await channel.send(embed=embed)
     await message.pin()
 
+    # restore special role overwrites (remove/restore to previous state) before unlocking the locked roles
+    try:
+        guild = channel.guild if hasattr(channel, "guild") else None
+        if guild:
+            await restore_special_roles(guild)
+    except Exception:
+        pass
+
     # unlock previously locked channels
     try:
         guild = channel.guild if hasattr(channel, "guild") else None
@@ -799,11 +915,16 @@ async def start_run(interaction: discord.Interaction):
         two_person_runs.clear()
         run_two_person_history_per_channel.clear()
 
-    # lock tracked channels for the specified role
+    # lock tracked channels for the specified roles
     try:
         guild = interaction.guild
         if guild:
             await lock_track_channels(guild)
+            # enable send_messages for any special role the command user has,
+            # saving previous overwrites so we can restore them when the run ends
+            member = guild.get_member(interaction.user.id)
+            if member:
+                await enable_special_roles_for_member(guild, member)
     except Exception:
         pass
 
@@ -990,6 +1111,14 @@ async def end_run(interaction: discord.Interaction, save: bool = True):
     )
 
     await interaction.response.send_message(embed=embed)
+
+    # restore special role overwrites (remove/restore to previous state) before unlocking the locked roles
+    try:
+        guild = interaction.guild
+        if guild:
+            await restore_special_roles(guild)
+    except Exception:
+        pass
 
     # unlock previously locked channels
     try:
@@ -1318,7 +1447,7 @@ async def all_runs(interaction: discord.Interaction):
     blocks = []
     for e in entries:
         team_label = e["team"].upper()
-        blocks.append(f"{team_label} #{e['attempt']} ATTEMPT")
+        blocks.append(f"**{team_label}** #{e['attempt']}")
         blocks.append(f"Numbers Counted: **{e['correct']:,}**")
         blocks.append(f"Accuracy **{e['accuracy']}**")
         blocks.append(f"Longest Run: **{e['longest']}**")
