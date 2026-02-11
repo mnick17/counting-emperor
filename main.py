@@ -148,6 +148,7 @@ alt_to_main = {
     898089548905578506: 495708539462090762,  # "marcin"
     915622952257601596: 885123109630406706,  # "milk"
     1247146814281613408: 904224456677945364, # "nai"
+    343209930590912525: 904224456677945364, # "nai2"
     0: 547612876530122763, # "nap"
     0: 1403694438143889498,# "nssleo"
     1: 1221444926819270763,# "sonic"
@@ -1447,7 +1448,7 @@ async def all_runs(interaction: discord.Interaction):
     blocks = []
     for e in entries:
         team_label = e["team"].upper()
-        blocks.append(f"**{team_label}** #{e['attempt']}")
+        blocks.append(f"**{team_label}** ({e['attempt']})")
         blocks.append(f"Numbers Counted: **{e['correct']:,}**")
         blocks.append(f"Accuracy **{e['accuracy']}**")
         blocks.append(f"Longest Run: **{e['longest']}**")
